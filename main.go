@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -84,6 +85,9 @@ func (d *Downloader) SetMaxRetries(retries int) *Downloader {
 }
 
 func (d *Downloader) SetBufferSize(size int) *Downloader {
+	if size < 1024 || size > 1024*1024 {
+		size = 32 * 1024
+	}
 	d.BufferSize = size
 	return d
 }
@@ -134,8 +138,20 @@ func (d *Downloader) Download(urlStr, customFilename string) *DownloadResult {
 	}
 	filepath := filepath.Join(d.DownloadDir, safeFilename)
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go d.handleInterrupt(cancel)
+
 	var lastError error
 	for retry := 0; retry <= d.MaxRetries; retry++ {
+		select {
+		case <-ctx.Done():
+			result.Error = "Download cancelled by user"
+			return result
+		default:
+		}
+
 		result.Retries = retry
 		resumeFrom := int64(0)
 		if d.canResume(filepath) {
@@ -145,7 +161,7 @@ func (d *Downloader) Download(urlStr, customFilename string) *DownloadResult {
 			}
 		}
 
-		size, err := d.downloadFile(urlStr, filepath, resumeFrom)
+		size, err := d.downloadFile(ctx, urlStr, filepath, resumeFrom)
 		if err == nil {
 			result.Success = true
 			result.Filename = safeFilename
@@ -159,10 +175,15 @@ func (d *Downloader) Download(urlStr, customFilename string) *DownloadResult {
 		}
 
 		lastError = err
-		if retry < d.MaxRetries {
+		if retry < d.MaxRetries && !errors.Is(err, context.Canceled) {
 			backoff := time.Duration(retry+1) * 2 * time.Second
 			fmt.Printf("Download failed, retrying in %v... (attempt %d/%d)\n", backoff, retry+1, d.MaxRetries)
-			time.Sleep(backoff)
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				result.Error = "Download cancelled during retry"
+				return result
+			}
 		}
 	}
 
@@ -173,10 +194,18 @@ func (d *Downloader) Download(urlStr, customFilename string) *DownloadResult {
 	return result
 }
 
+func (d *Downloader) handleInterrupt(cancel context.CancelFunc) {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	<-sigCh
+	fmt.Printf("\nReceived interrupt signal, cancelling download...\n")
+	cancel()
+}
+
 func (d *Downloader) validateURL(urlStr string) error {
 	u, err := url.Parse(urlStr)
 	if err != nil {
-		return fmt.Errorf("invalid URL: %v", err)
+		return fmt.Errorf("invalid URL")
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return errors.New("only HTTP and HTTPS URLs are supported")
@@ -201,23 +230,32 @@ func (d *Downloader) sanitizeFilename(filename string) (string, error) {
 }
 
 func (d *Downloader) checkDiskSpace() error {
-	var stat syscall.Statfs_t
 	wd, err := os.Getwd()
 	if err != nil {
 		return nil
 	}
 
-	err = syscall.Statfs(wd, &stat)
-	if err != nil {
+	var freeSpace uint64
+	if stat, ok := d.getDiskSpace(wd); ok {
+		freeSpace = stat
+	} else {
 		return nil
 	}
 
-	freeSpace := stat.Bavail * uint64(stat.Bsize)
 	if freeSpace < 100*1024*1024 {
 		return fmt.Errorf("insufficient disk space: %s available", formatBytes(int64(freeSpace)))
 	}
 
 	return nil
+}
+
+func (d *Downloader) getDiskSpace(path string) (uint64, bool) {
+	var stat syscall.Statfs_t
+	err := syscall.Statfs(path, &stat)
+	if err != nil {
+		return 0, false
+	}
+	return stat.Bavail * uint64(stat.Bsize), true
 }
 
 func (d *Downloader) generateFilename(urlStr string) string {
@@ -260,6 +298,7 @@ func (d *Downloader) createHTTPClient() *http.Client {
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+		ForceAttemptHTTP2:     true,
 	}
 
 	client := &http.Client{
@@ -279,20 +318,14 @@ func (d *Downloader) createHTTPClient() *http.Client {
 	return client
 }
 
-func (d *Downloader) downloadFile(urlStr, filepath string, resumeFrom int64) (int64, error) {
-	ctx := context.Background()
-	if d.Timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(context.Background(), d.Timeout)
-		defer cancel()
-	}
-
+func (d *Downloader) downloadFile(ctx context.Context, urlStr, filepath string, resumeFrom int64) (int64, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
 	if err != nil {
 		return 0, err
 	}
 
 	req.Header.Set("User-Agent", d.UserAgent)
+	req.Header.Set("Accept-Encoding", "identity")
 	if resumeFrom > 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", resumeFrom))
 	}
@@ -305,7 +338,7 @@ func (d *Downloader) downloadFile(urlStr, filepath string, resumeFrom int64) (in
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		return 0, fmt.Errorf("HTTP error: %s", resp.Status)
+		return 0, fmt.Errorf("HTTP error: %d", resp.StatusCode)
 	}
 
 	if d.MaxSize > 0 {
@@ -314,8 +347,7 @@ func (d *Downloader) downloadFile(urlStr, filepath string, resumeFrom int64) (in
 			contentLength += resumeFrom
 		}
 		if contentLength > d.MaxSize {
-			return 0, fmt.Errorf("file size %s exceeds maximum allowed %s",
-				formatBytes(contentLength), formatBytes(d.MaxSize))
+			return 0, fmt.Errorf("file size exceeds maximum allowed %s", formatBytes(d.MaxSize))
 		}
 	}
 
@@ -342,8 +374,7 @@ func (d *Downloader) downloadFile(urlStr, filepath string, resumeFrom int64) (in
 	}
 
 	if d.MaxSize > 0 && totalSize > d.MaxSize {
-		return 0, fmt.Errorf("file size %s exceeds maximum allowed %s",
-			formatBytes(totalSize), formatBytes(d.MaxSize))
+		return 0, fmt.Errorf("file size exceeds maximum allowed %s", formatBytes(d.MaxSize))
 	}
 
 	reader := bufio.NewReader(resp.Body)
@@ -351,21 +382,45 @@ func (d *Downloader) downloadFile(urlStr, filepath string, resumeFrom int64) (in
 	var totalWritten int64 = resumeFrom
 	lastUpdate := time.Now()
 	startTime := time.Now()
-	lastBytes := resumeFrom
+	lastSpeedTime := startTime
+	lastSpeedBytes := resumeFrom
 
-	fmt.Printf("Downloading: %s\n", urlStr)
+	// Simple filename display without filepath.Base
+	displayName := "file"
+	u, _ := url.Parse(urlStr)
+	if u != nil && u.Path != "" {
+		// Extract filename from path manually
+		path := u.Path
+		if idx := strings.LastIndex(path, "/"); idx != -1 && idx < len(path)-1 {
+			displayName = path[idx+1:]
+		} else if path != "/" {
+			displayName = path
+		}
+	}
+	
+	fmt.Printf("Downloading: %s\n", displayName)
 	if resumeFrom > 0 {
 		fmt.Printf("Resuming from: %s\n", formatBytes(resumeFrom))
 	}
 
 	for {
+		select {
+		case <-ctx.Done():
+			return totalWritten, ctx.Err()
+		default:
+		}
+
 		n, err := reader.Read(buffer)
 		if n > 0 {
 			if d.MaxSpeed > 0 {
 				expectedTime := time.Duration(n) * time.Second / time.Duration(d.MaxSpeed)
 				elapsed := time.Since(lastUpdate)
 				if elapsed < expectedTime {
-					time.Sleep(expectedTime - elapsed)
+					select {
+					case <-time.After(expectedTime - elapsed):
+					case <-ctx.Done():
+						return totalWritten, ctx.Err()
+					}
 				}
 			}
 
@@ -379,10 +434,13 @@ func (d *Downloader) downloadFile(urlStr, filepath string, resumeFrom int64) (in
 				return totalWritten, fmt.Errorf("file size exceeded maximum allowed %s", formatBytes(d.MaxSize))
 			}
 
-			if time.Since(lastUpdate) >= time.Second {
-				d.printProgress(totalWritten, totalSize, startTime, lastBytes)
-				lastUpdate = time.Now()
-				lastBytes = totalWritten
+			now := time.Now()
+			if now.Sub(lastUpdate) >= time.Second {
+				instantSpeed := float64(totalWritten-lastSpeedBytes) / now.Sub(lastSpeedTime).Seconds()
+				d.printProgress(totalWritten, totalSize, instantSpeed)
+				lastUpdate = now
+				lastSpeedTime = now
+				lastSpeedBytes = totalWritten
 			}
 		}
 
@@ -392,15 +450,10 @@ func (d *Downloader) downloadFile(urlStr, filepath string, resumeFrom int64) (in
 			}
 			return totalWritten, err
 		}
-
-		select {
-		case <-ctx.Done():
-			return totalWritten, ctx.Err()
-		default:
-		}
 	}
 
-	d.printProgress(totalWritten, totalSize, startTime, lastBytes)
+	instantSpeed := float64(totalWritten-lastSpeedBytes) / time.Since(lastSpeedTime).Seconds()
+	d.printProgress(totalWritten, totalSize, instantSpeed)
 	fmt.Println()
 
 	if totalSize > 0 && totalWritten != totalSize {
@@ -411,21 +464,15 @@ func (d *Downloader) downloadFile(urlStr, filepath string, resumeFrom int64) (in
 	return totalWritten, nil
 }
 
-func (d *Downloader) printProgress(downloaded, total int64, startTime time.Time, lastBytes int64) {
-	elapsed := time.Since(startTime).Seconds()
+func (d *Downloader) printProgress(downloaded, total int64, instantSpeed float64) {
 	percent := float64(0)
 	if total > 0 {
 		percent = float64(downloaded) / float64(total) * 100
 	}
 
-	speed := float64(0)
-	if elapsed > 0 {
-		speed = float64(downloaded-lastBytes) / time.Since(startTime).Seconds()
-	}
-
 	eta := time.Duration(0)
-	if speed > 0 && total > 0 {
-		remaining := float64(total-downloaded) / speed
+	if instantSpeed > 0 && total > 0 {
+		remaining := float64(total-downloaded) / instantSpeed
 		eta = time.Duration(remaining) * time.Second
 	}
 
@@ -435,7 +482,7 @@ func (d *Downloader) printProgress(downloaded, total int64, startTime time.Time,
 	if total > 0 {
 		totalStr = formatBytes(total)
 	}
-	speedStr := formatBytes(int64(speed)) + "/s"
+	speedStr := formatBytes(int64(instantSpeed)) + "/s"
 	etaStr := formatTime(eta)
 
 	fmt.Printf("\r%s %.1f%% | %s/%s | Speed: %s | ETA: %s",
@@ -613,6 +660,13 @@ func main() {
 				}
 			case "--no-ssl-verify":
 				downloader.SetVerifySSL(false)
+			case "--buffer-size":
+				if i+1 < len(os.Args) {
+					if size, err := strconv.Atoi(os.Args[i+1]); err == nil {
+						downloader.SetBufferSize(size)
+						i++
+					}
+				}
 			default:
 				if !strings.HasPrefix(os.Args[i], "-") && urlStr == "" {
 					urlStr = os.Args[i]
@@ -656,6 +710,7 @@ func printHelp() {
 	fmt.Printf("  --timeout SECONDS    Overall timeout in seconds\n")
 	fmt.Printf("  --max-size BYTES     Maximum file size in bytes\n")
 	fmt.Printf("  --max-speed BYTES    Maximum download speed in bytes/sec\n")
+	fmt.Printf("  --buffer-size BYTES  Buffer size for download (1024-1048576)\n")
 	fmt.Printf("  --no-ssl-verify      Disable SSL certificate verification\n")
 	fmt.Printf("  --stats              Show download statistics\n")
 	fmt.Printf("  --cleanup [HOURS]    Cleanup old files (default: 24 hours)\n")
