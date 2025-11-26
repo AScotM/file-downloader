@@ -226,6 +226,17 @@ func (d *Downloader) sanitizeFilename(filename string) (string, error) {
 		return "", errors.New("invalid filename")
 	}
 
+	clean = filepath.Base(clean)
+	
+	dangerousChars := []string{"/", "\\", ":", "*", "?", "\"", "<", ">", "|"}
+	for _, char := range dangerousChars {
+		clean = strings.ReplaceAll(clean, char, "_")
+	}
+
+	if len(clean) > 255 {
+		clean = clean[:255]
+	}
+
 	return clean, nil
 }
 
@@ -326,6 +337,7 @@ func (d *Downloader) downloadFile(ctx context.Context, urlStr, filepath string, 
 
 	req.Header.Set("User-Agent", d.UserAgent)
 	req.Header.Set("Accept-Encoding", "identity")
+	req.Close = true
 	if resumeFrom > 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", resumeFrom))
 	}
@@ -338,19 +350,33 @@ func (d *Downloader) downloadFile(ctx context.Context, urlStr, filepath string, 
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		return 0, fmt.Errorf("HTTP error: %d", resp.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return 0, fmt.Errorf("HTTP error %d: %s", resp.StatusCode, string(body))
+	}
+
+	if resumeFrom > 0 && resp.StatusCode == http.StatusOK {
+		return 0, errors.New("server does not support resume")
 	}
 
 	if d.MaxSize > 0 {
-		contentLength := resp.ContentLength
+		var contentLength int64
 		if resp.Header.Get("Content-Range") != "" {
-			contentLength += resumeFrom
+			rangeHeader := resp.Header.Get("Content-Range")
+			if parts := strings.Split(rangeHeader, "/"); len(parts) == 2 {
+				if total, err := strconv.ParseInt(parts[1], 10, 64); err == nil {
+					contentLength = total
+				}
+			}
+		} else if resp.ContentLength > 0 {
+			contentLength = resp.ContentLength
 		}
-		if contentLength > d.MaxSize {
+		
+		if contentLength > 0 && contentLength > d.MaxSize {
 			return 0, fmt.Errorf("file size exceeds maximum allowed %s", formatBytes(d.MaxSize))
 		}
 	}
 
+	tempFilepath := filepath + ".download"
 	flags := os.O_CREATE | os.O_WRONLY
 	if resumeFrom > 0 {
 		flags |= os.O_APPEND
@@ -358,11 +384,20 @@ func (d *Downloader) downloadFile(ctx context.Context, urlStr, filepath string, 
 		flags |= os.O_TRUNC
 	}
 
-	file, err := os.OpenFile(filepath, flags, 0644)
+	file, err := os.OpenFile(tempFilepath, flags, 0644)
 	if err != nil {
 		return 0, err
 	}
-	defer file.Close()
+	
+	var totalWritten int64
+	defer func() {
+		file.Close()
+		if err == nil {
+			os.Rename(tempFilepath, filepath)
+		} else {
+			os.Remove(tempFilepath)
+		}
+	}()
 
 	var totalSize int64
 	if resp.Header.Get("Content-Range") != "" {
@@ -379,17 +414,15 @@ func (d *Downloader) downloadFile(ctx context.Context, urlStr, filepath string, 
 
 	reader := bufio.NewReader(resp.Body)
 	buffer := make([]byte, d.BufferSize)
-	var totalWritten int64 = resumeFrom
+	totalWritten = resumeFrom
 	lastUpdate := time.Now()
 	startTime := time.Now()
 	lastSpeedTime := startTime
 	lastSpeedBytes := resumeFrom
 
-	// Simple filename display without filepath.Base
 	displayName := "file"
 	u, _ := url.Parse(urlStr)
 	if u != nil && u.Path != "" {
-		// Extract filename from path manually
 		path := u.Path
 		if idx := strings.LastIndex(path, "/"); idx != -1 && idx < len(path)-1 {
 			displayName = path[idx+1:]
@@ -416,12 +449,14 @@ func (d *Downloader) downloadFile(ctx context.Context, urlStr, filepath string, 
 				expectedTime := time.Duration(n) * time.Second / time.Duration(d.MaxSpeed)
 				elapsed := time.Since(lastUpdate)
 				if elapsed < expectedTime {
+					sleepTime := expectedTime - elapsed
 					select {
-					case <-time.After(expectedTime - elapsed):
+					case <-time.After(sleepTime):
 					case <-ctx.Done():
 						return totalWritten, ctx.Err()
 					}
 				}
+				lastUpdate = time.Now()
 			}
 
 			written, writeErr := file.Write(buffer[:n])
@@ -466,27 +501,35 @@ func (d *Downloader) downloadFile(ctx context.Context, urlStr, filepath string, 
 
 func (d *Downloader) printProgress(downloaded, total int64, instantSpeed float64) {
 	percent := float64(0)
+	totalStr := "Unknown"
+	
 	if total > 0 {
 		percent = float64(downloaded) / float64(total) * 100
+		totalStr = formatBytes(total)
 	}
 
 	eta := time.Duration(0)
-	if instantSpeed > 0 && total > 0 {
-		remaining := float64(total-downloaded) / instantSpeed
-		eta = time.Duration(remaining) * time.Second
+	if instantSpeed > 0 {
+		if total > 0 {
+			remaining := float64(total-downloaded) / instantSpeed
+			eta = time.Duration(remaining) * time.Second
+		} else {
+			eta = time.Duration(0)
+		}
 	}
 
 	progressBar := getProgressBar(percent, 30)
 	downloadedStr := formatBytes(downloaded)
-	totalStr := "Unknown"
-	if total > 0 {
-		totalStr = formatBytes(total)
-	}
 	speedStr := formatBytes(int64(instantSpeed)) + "/s"
 	etaStr := formatTime(eta)
 
-	fmt.Printf("\r%s %.1f%% | %s/%s | Speed: %s | ETA: %s",
-		progressBar, percent, downloadedStr, totalStr, speedStr, etaStr)
+	if total > 0 {
+		fmt.Printf("\r%s %.1f%% | %s/%s | Speed: %s | ETA: %s",
+			progressBar, percent, downloadedStr, totalStr, speedStr, etaStr)
+	} else {
+		fmt.Printf("\r%s %s | Speed: %s | Time: %s",
+			progressBar, downloadedStr, speedStr, etaStr)
+	}
 }
 
 func getProgressBar(percent float64, width int) string {
